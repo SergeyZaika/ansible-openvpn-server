@@ -1,0 +1,283 @@
+---
+- name: Install, Configure, and Finalize OpenVPN
+  hosts: vpn_server
+  become: yes
+  vars:
+    country: "country"
+    province: "province"
+    city: "city"
+    organization: "ExampleOrg"
+    email: "admin@example.com"
+    organizational_unit: "organizational_unit"
+    local_user: "ubuntu"
+    vpn_user: "client1"
+    server_ip: "vpn.example.com"
+    packages:
+      - openvpn
+      - easy-rsa
+      - iptables-persistent
+    iptables_rules:
+      - { table: nat, chain: POSTROUTING, source: "10.8.0.0/24", out_interface: eth0, jump: MASQUERADE }
+      - { chain: FORWARD, match: state, ctstate: RELATED,ESTABLISHED, jump: ACCEPT }
+      - { chain: FORWARD, source: "10.8.0.0/24", jump: ACCEPT }
+    server_files:
+      - { src: "/home/{{ local_user }}/openvpn-ca/pki/ca.crt", dest: "/etc/openvpn/ca.crt" }
+      - { src: "/home/{{ local_user }}/openvpn-ca/pki/issued/server.crt", dest: "/etc/openvpn/server.crt" }
+      - { src: "/home/{{ local_user }}/openvpn-ca/pki/private/server.key", dest: "/etc/openvpn/server.key" }
+      - { src: "/home/{{ local_user }}/openvpn-ca/pki/dh.pem", dest: "/etc/openvpn/dh.pem" }
+      - { src: "/home/{{ local_user }}/openvpn-ca/pki/ta.key", dest: "/etc/openvpn/ta.key" }
+    client_files:
+      - { src: "/home/{{ local_user }}/openvpn-ca/pki/issued/{{ vpn_user }}.crt", dest: "/home/{{ local_user }}/client-configs/keys/{{ vpn_user }}.crt" }
+      - { src: "/home/{{ local_user }}/openvpn-ca/pki/private/{{ vpn_user }}.key", dest: "/home/{{ local_user }}/client-configs/keys/{{ vpn_user }}.key" }
+      - { src: "/home/{{ local_user }}/openvpn-ca/pki/ta.key", dest: "/home/{{ local_user }}/client-configs/keys/" }
+
+  tasks:
+    - name: Update and upgrade apt packages
+      apt:
+        update_cache: yes
+        upgrade: dist
+
+    - name: Add user '{{ local_user }}' to sudoers with no password
+      lineinfile:
+        path: /etc/sudoers
+        state: present
+        regexp: '^{{ local_user }}'
+        line: '{{ local_user }} ALL=(ALL) NOPASSWD:ALL'
+        validate: 'visudo -cf %s'
+
+    - name: Install required packages
+      apt:
+        name: "{{ packages }}"
+        state: present
+
+    - name: Make Easy-RSA directory
+      file:
+        path: /home/{{ local_user }}/openvpn-ca
+        state: directory
+
+    - name: Copy Easy-RSA scripts
+      copy:
+        remote_src: yes
+        src: /usr/share/easy-rsa/
+        dest: /home/{{ local_user }}/openvpn-ca/
+        mode: '0755'
+
+    - name: Check if PKI directory exists
+      stat:
+        path: /home/{{ local_user }}/openvpn-ca/pki
+      register: pki_dir
+
+    - name: Initialize the PKI
+      command: ./easyrsa init-pki
+      args:
+        chdir: /home/{{ local_user }}/openvpn-ca
+      when: pki_dir.stat.exists == false
+
+    - name: Build the CA
+      command: "./easyrsa build-ca nopass"
+      args:
+        chdir: /home/{{ local_user }}/openvpn-ca
+      environment:
+        EASYRSA_BATCH: "yes"
+        EASYRSA_REQ_COUNTRY: "{{ country }}"
+        EASYRSA_REQ_PROVINCE: "{{ province }}"
+        EASYRSA_REQ_CITY: "{{ city }}"
+        EASYRSA_REQ_ORG: "{{ organization }}"
+        EASYRSA_REQ_EMAIL: "{{ email }}"
+        EASYRSA_REQ_OU: "{{ organizational_unit }}"
+      when: pki_dir.stat.exists == false
+
+    - name: Generate server certificate and key
+      command: "./easyrsa gen-req server nopass"
+      args:
+        chdir: /home/{{ local_user }}/openvpn-ca
+      environment:
+        EASYRSA_BATCH: "yes"
+
+    - name: Sign server certificate
+      command: "./easyrsa sign-req server server"
+      args:
+        chdir: /home/{{ local_user }}/openvpn-ca
+      environment:
+        EASYRSA_BATCH: "yes"
+
+    - name: Generate Diffie-Hellman parameters
+      command: "./easyrsa gen-dh"
+      args:
+        chdir: /home/{{ local_user }}/openvpn-ca
+
+    - name: Generate HMAC key
+      command: openvpn --genkey --secret ta.key
+      args:
+        chdir: /home/{{ local_user }}/openvpn-ca/pki
+
+    - name: Generate client certificate and key
+      command: "./easyrsa gen-req {{ vpn_user }} nopass"
+      args:
+        chdir: /home/{{ local_user }}/openvpn-ca
+      environment:
+        EASYRSA_BATCH: "yes"
+
+    - name: Sign client certificate
+      command: "./easyrsa sign-req client {{ vpn_user }}"
+      args:
+        chdir: /home/{{ local_user }}/openvpn-ca
+      environment:
+        EASYRSA_BATCH: "yes"
+
+    - name: Copy server certificates and keys
+      copy:
+        remote_src: yes
+        src: "{{ item.src }}"
+        dest: "{{ item.dest }}"
+      loop: "{{ server_files }}"
+
+    - name: Create OpenVPN server configuration file
+      copy:
+        dest: /etc/openvpn/server.conf
+        content: |
+          port 1194
+          proto udp
+          dev tun
+          ca ca.crt
+          cert server.crt
+          key server.key
+          dh dh.pem
+          tls-auth ta.key 0
+          cipher AES-256-CBC
+          auth SHA256
+          server 10.8.0.0 255.255.255.0
+          ifconfig-pool-persist ipp.txt
+          push "redirect-gateway def1 bypass-dhcp"
+          push "dhcp-option DNS 8.8.8.8"
+          push "dhcp-option DNS 8.8.4.4"
+          keepalive 10 120
+          persist-key
+          persist-tun
+          status openvpn-status.log
+          log-append /var/log/openvpn.log
+          verb 3
+
+    - name: Enable IP forwarding
+      sysctl:
+        name: net.ipv4.ip_forward
+        value: '1'
+        state: present
+        reload: yes
+
+    - name: Apply iptables rules for NAT
+      iptables:
+        table: nat
+        chain: POSTROUTING
+        source: 10.8.0.0/24
+        out_interface: eth0
+        jump: MASQUERADE
+
+    - name: Allow forwarded traffic for established connections
+      iptables:
+        chain: FORWARD
+        match: state
+        ctstate: RELATED,ESTABLISHED
+        jump: ACCEPT
+
+    - name: Allow forwarding traffic from VPN
+      iptables:
+        chain: FORWARD
+        source: 10.8.0.0/24
+        jump: ACCEPT
+
+    - name: Create iptables directory
+      file:
+        path: /etc/iptables
+        state: directory
+
+    - name: Save iptables rules
+      shell: iptables-save > /etc/iptables/rules.v4
+
+    - name: Start and enable OpenVPN service
+      systemd:
+        name: openvpn@server
+        enabled: yes
+        state: started
+
+    - name: Ensure OpenVPN service is enabled and started
+      systemd:
+        name: openvpn
+        enabled: yes
+        state: started
+
+    - name: Create client config directories
+      file:
+        path: "/home/{{ local_user }}/client-configs/{{ item }}"
+        state: directory
+        mode: '0700'
+      loop:
+        - keys
+        - files
+
+    - name: Copy client certificates and keys
+      copy:
+        remote_src: yes
+        src: "{{ item.src }}"
+        dest: "{{ item.dest }}"
+      loop: "{{ client_files }}"
+
+    - name: Create client base configuration file
+      copy:
+        dest: /home/{{ local_user }}/client-configs/base.conf
+        content: |
+          client
+          dev tun
+          proto udp
+          remote {{ server_ip }} 1194
+          resolv-retry infinite
+          nobind
+          persist-key
+          persist-tun
+          remote-cert-tls server
+          cipher AES-256-CBC
+          auth SHA256
+          key-direction 1
+          verb 3
+
+    - name: Create client configuration script
+      copy:
+        dest: /home/{{ local_user }}/client-configs/make_config.sh
+        content: |
+          #!/bin/bash
+
+          # First argument: Client identifier
+
+          KEY_DIR=/home/{{ local_user }}/client-configs/keys
+          OUTPUT_DIR=/home/{{ local_user }}/client-configs/files
+          BASE_CONFIG=/home/{{ local_user }}/client-configs/base.conf
+
+          cat ${BASE_CONFIG} \
+              <(echo -e '<ca>') \
+              /home/{{ local_user }}/openvpn-ca/pki/ca.crt \
+              <(echo -e '</ca>\n<cert>') \
+              ${KEY_DIR}/${1}.crt \
+              <(echo -e '</cert>\n<key>') \
+              ${KEY_DIR}/${1}.key \
+              <(echo -e '</key>\n<tls-auth>') \
+              ${KEY_DIR}/ta.key \
+              <(echo -e '</tls-auth>') \
+              > ${OUTPUT_DIR}/${1}.ovpn
+
+    - name: Make client configuration script executable
+      file:
+        path: /home/{{ local_user }}/client-configs/make_config.sh
+        mode: '0700'
+
+    - name: Change ownership of client-configs directory
+      file:
+        path: /home/{{ local_user }}/client-configs
+        state: directory
+        owner: "{{ local_user }}"
+        group: "{{ local_user }}"
+        recurse: yes
+
+    - name: Generate client configuration file
+      command: ./make_config.sh {{ vpn_user }}
+      args:
+        chdir: /home/{{ local_user }}/client-configs

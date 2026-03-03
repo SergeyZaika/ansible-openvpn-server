@@ -1,0 +1,82 @@
+---
+- name: Cleanup OpenVPN installation
+  hosts: vpn_server
+  become: yes
+  tasks:
+    - name: Check for openvpn@server service
+      command: systemctl list-units --type=service --state=active
+      register: openvpn_services
+
+    - name: Stop OpenVPN service
+      systemd:
+        name: openvpn@server
+        state: stopped
+        enabled: no
+      when: "'openvpn@server.service' in openvpn_services.stdout"
+
+    - name: Remove OpenVPN and EasyRSA packages
+      apt:
+        name: 
+          - openvpn
+          - easy-rsa
+          - iptables-persistent
+        state: absent
+        purge: yes
+
+    - name: Autoremove unnecessary packages
+      apt:
+        autoremove: yes
+
+    - name: Remove EasyRSA directory
+      file:
+        path: /home/ubuntu/openvpn-ca
+        state: absent
+
+    - name: Remove OpenVPN configuration and keys
+      file:
+        path: /etc/openvpn
+        state: absent
+
+    - name: Remove client configuration directories
+      file:
+        path: /home/ubuntu/client-configs
+        state: absent
+
+    - name: Flush iptables rules
+      command: iptables -F
+
+    - name: Flush NAT iptables rules
+      command: iptables -t nat -F
+
+    - name: Flush mangle iptables rules
+      command: iptables -t mangle -F
+
+    - name: Delete all non-default chains
+      command: iptables -X
+
+    - name: Create iptables directory
+      file:
+        path: /etc/iptables
+        state: directory
+
+    - name: Save empty iptables rules
+      shell: iptables-save > /etc/iptables/rules.v4
+
+    - name: Disable IP forwarding
+      sysctl:
+        name: net.ipv4.ip_forward
+        value: '0'
+        state: present
+
+    - name: Remove IP forwarding configuration from sysctl.conf
+      lineinfile:
+        path: /etc/sysctl.conf
+        state: absent
+        regexp: '^net.ipv4.ip_forward=1'
+
+    - name: Reload sysctl configuration
+      command: sysctl -p
+
+    - name: Display cleanup completed message
+      debug:
+        msg: "Cleanup completed successfully."
